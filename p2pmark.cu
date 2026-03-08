@@ -16,9 +16,26 @@
     }                                                                     \
   } while (0)
 
+// Bandwidth mode constants.
 static constexpr size_t TRANSFER_SIZE = 64 * 1024 * 1024;  // 64 MB
 static constexpr int WARMUP = 5;
 static constexpr int ITERS = 20;
+
+// Latency mode constants.
+static constexpr size_t LATENCY_SIZE = 128;  // one cacheline
+static constexpr int LATENCY_WORDS = LATENCY_SIZE / sizeof(int);
+static constexpr int LATENCY_WARMUP = 500;
+static constexpr int LATENCY_ITERS = 10000;
+
+// Single-thread kernel that reads `words` ints from a remote GPU pointer.
+// P2P access must be enabled so `remote` (allocated on another GPU) is
+// directly accessible from the launching GPU.
+__global__ void latency_read_kernel(const int* __restrict__ remote, int* local, int words) {
+  int sum = 0;
+  for (int i = 0; i < words; i++)
+    sum += remote[i];
+  local[0] = sum;
+}
 
 // Measure unidirectional D2D bandwidth from src GPU to dst GPU.
 double measure_bw(int src, int dst, size_t bytes, cudaStream_t stream) {
@@ -51,7 +68,14 @@ double measure_bw(int src, int dst, size_t bytes, cudaStream_t stream) {
   return gbps;
 }
 
-int main() {
+static void run_latency_tests(int ngpu);
+
+int main(int argc, char** argv) {
+  bool latency_mode = false;
+  for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--latency") latency_mode = true;
+  }
+
   int ngpu;
   CHECK(cudaGetDeviceCount(&ngpu));
   printf("Found %d GPUs\n\n", ngpu);
@@ -67,6 +91,11 @@ int main() {
         cudaDeviceEnablePeerAccess(j, 0);  // ignore already-enabled error
       }
     }
+  }
+
+  if (latency_mode) {
+    run_latency_tests(ngpu);
+    return 0;
   }
 
   // ---- Test 1: Sequential NxN ----
@@ -363,4 +392,305 @@ int main() {
   }
 
   return 0;
+}
+
+// ---- Latency mode ----
+
+// Measure latency of a single remote read (8KB) from reader GPU reading src_buf
+// on another GPU. Returns average latency in microseconds.
+static double measure_latency(int reader, void* src_buf, void* local_buf,
+                              cudaStream_t stream) {
+  // Warmup.
+  for (int i = 0; i < LATENCY_WARMUP; i++)
+    latency_read_kernel<<<1, 1, 0, stream>>>((const int*)src_buf, (int*)local_buf, LATENCY_WORDS);
+  CHECK(cudaStreamSynchronize(stream));
+
+  cudaEvent_t start, stop;
+  CHECK(cudaEventCreate(&start));
+  CHECK(cudaEventCreate(&stop));
+  CHECK(cudaEventRecord(start, stream));
+  for (int i = 0; i < LATENCY_ITERS; i++)
+    latency_read_kernel<<<1, 1, 0, stream>>>((const int*)src_buf, (int*)local_buf, LATENCY_WORDS);
+  CHECK(cudaEventRecord(stop, stream));
+  CHECK(cudaStreamSynchronize(stream));
+
+  float ms;
+  CHECK(cudaEventElapsedTime(&ms, start, stop));
+  CHECK(cudaEventDestroy(start));
+  CHECK(cudaEventDestroy(stop));
+  return (double)ms * 1000.0 / LATENCY_ITERS;  // microseconds
+}
+
+static void run_latency_tests(int ngpu) {
+  printf("=== LATENCY MODE (%zu-byte remote reads, %d iterations) ===\n\n", LATENCY_SIZE, LATENCY_ITERS);
+
+  // Allocate one source buffer and one local scratch per GPU.
+  std::vector<void*> bufs(ngpu), local(ngpu);
+  std::vector<cudaStream_t> streams(ngpu);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaMalloc(&bufs[i], LATENCY_SIZE));
+    CHECK(cudaMemset(bufs[i], i, LATENCY_SIZE));
+    CHECK(cudaMalloc(&local[i], sizeof(int)));
+    CHECK(cudaStreamCreate(&streams[i]));
+  }
+
+  // ---- Test 1: Sequential NxN latency ----
+  printf("=== Sequential P2P latency (us) ===\n\n");
+
+  std::vector<std::vector<double>> seq_lat(ngpu, std::vector<double>(ngpu, 0.0));
+
+  printf("%6s", "Src->");
+  for (int s = 0; s < ngpu; s++) printf("  GPU%-4d", s);
+  printf("\n");
+
+  for (int r = 0; r < ngpu; r++) {
+    printf("GPU %d:", r);
+    CHECK(cudaSetDevice(r));
+    for (int s = 0; s < ngpu; s++) {
+      if (r == s) {
+        printf("     -   ");
+        continue;
+      }
+      double us = measure_latency(r, bufs[s], local[r], streams[r]);
+      seq_lat[r][s] = us;
+      printf("  %6.2f  ", us);
+    }
+    printf("\n");
+  }
+
+  double seq_avg = 0;
+  int seq_count = 0;
+  for (int r = 0; r < ngpu; r++)
+    for (int s = 0; s < ngpu; s++)
+      if (r != s) { seq_avg += seq_lat[r][s]; seq_count++; }
+  seq_avg /= seq_count;
+  printf("\nAverage 1:1 latency: %.2f us\n", seq_avg);
+
+  // ---- Test 2: Topology probe latency ----
+  printf("\n=== Topology probe: staggered reads by peer distance (us) ===\n");
+  printf("%d concurrent kernel launches per round.\n\n", ngpu);
+
+  for (int r = 0; r < ngpu - 1; r++) {
+    int offset = r + 1;
+
+    // Warmup.
+    for (int i = 0; i < ngpu; i++) {
+      int peer = (i + offset) % ngpu;
+      CHECK(cudaSetDevice(i));
+      for (int w = 0; w < LATENCY_WARMUP; w++)
+        latency_read_kernel<<<1, 1, 0, streams[i]>>>((const int*)bufs[peer], (int*)local[i], LATENCY_WORDS);
+    }
+    for (int i = 0; i < ngpu; i++) {
+      CHECK(cudaSetDevice(i));
+      CHECK(cudaStreamSynchronize(streams[i]));
+    }
+
+    // Timed.
+    std::vector<cudaEvent_t> starts(ngpu), stops(ngpu);
+    for (int i = 0; i < ngpu; i++) {
+      CHECK(cudaSetDevice(i));
+      CHECK(cudaEventCreate(&starts[i]));
+      CHECK(cudaEventCreate(&stops[i]));
+    }
+
+    std::barrier round_barrier(ngpu);
+    std::vector<double> per_gpu_lat(ngpu);
+    std::vector<std::thread> round_threads;
+
+    for (int i = 0; i < ngpu; i++) {
+      round_threads.emplace_back([&, i, offset]() {
+        int peer = (i + offset) % ngpu;
+        CHECK(cudaSetDevice(i));
+
+        round_barrier.arrive_and_wait();
+
+        CHECK(cudaEventRecord(starts[i], streams[i]));
+        for (int it = 0; it < LATENCY_ITERS; it++)
+          latency_read_kernel<<<1, 1, 0, streams[i]>>>((const int*)bufs[peer], (int*)local[i], LATENCY_WORDS);
+        CHECK(cudaEventRecord(stops[i], streams[i]));
+        CHECK(cudaStreamSynchronize(streams[i]));
+
+        float ms;
+        CHECK(cudaEventElapsedTime(&ms, starts[i], stops[i]));
+        per_gpu_lat[i] = (double)ms * 1000.0 / LATENCY_ITERS;
+      });
+    }
+    for (auto& t : round_threads) t.join();
+
+    double avg = 0;
+    for (int i = 0; i < ngpu; i++) avg += per_gpu_lat[i];
+    avg /= ngpu;
+    printf("+%d  ", offset);
+    for (int i = 0; i < ngpu; i++) {
+      int peer = (i + offset) % ngpu;
+      printf("%d<-%d ", i, peer);
+    }
+    printf(" %6.2f us avg\n", avg);
+
+    for (int i = 0; i < ngpu; i++) {
+      CHECK(cudaSetDevice(i));
+      CHECK(cudaEventDestroy(starts[i]));
+      CHECK(cudaEventDestroy(stops[i]));
+    }
+  }
+
+  // ---- Test 2b: Single reader, all peers concurrent ----
+  printf("\n=== Single reader, all %d peers concurrent (us) ===\n\n", ngpu - 1);
+
+  std::vector<double> sr_lat(ngpu);
+
+  for (int reader = 0; reader < ngpu; reader++) {
+    CHECK(cudaSetDevice(reader));
+    std::vector<cudaStream_t> peer_streams(ngpu - 1);
+    std::vector<void*> peer_local(ngpu - 1);
+    for (int r = 0; r < ngpu - 1; r++) {
+      CHECK(cudaStreamCreate(&peer_streams[r]));
+      CHECK(cudaMalloc(&peer_local[r], sizeof(int)));
+    }
+
+    // Warmup.
+    for (int r = 0; r < ngpu - 1; r++) {
+      int peer = (reader + r + 1) % ngpu;
+      for (int w = 0; w < LATENCY_WARMUP; w++)
+        latency_read_kernel<<<1, 1, 0, peer_streams[r]>>>((const int*)bufs[peer], (int*)peer_local[r], LATENCY_WORDS);
+    }
+    for (int r = 0; r < ngpu - 1; r++)
+      CHECK(cudaStreamSynchronize(peer_streams[r]));
+
+    // Timed: all streams launch concurrently.
+    std::vector<cudaEvent_t> starts(ngpu - 1), stops(ngpu - 1);
+    for (int r = 0; r < ngpu - 1; r++) {
+      CHECK(cudaEventCreate(&starts[r]));
+      CHECK(cudaEventCreate(&stops[r]));
+    }
+    for (int r = 0; r < ngpu - 1; r++) {
+      int peer = (reader + r + 1) % ngpu;
+      CHECK(cudaEventRecord(starts[r], peer_streams[r]));
+      for (int it = 0; it < LATENCY_ITERS; it++)
+        latency_read_kernel<<<1, 1, 0, peer_streams[r]>>>((const int*)bufs[peer], (int*)peer_local[r], LATENCY_WORDS);
+      CHECK(cudaEventRecord(stops[r], peer_streams[r]));
+    }
+    for (int r = 0; r < ngpu - 1; r++)
+      CHECK(cudaStreamSynchronize(peer_streams[r]));
+
+    double max_lat = 0;
+    for (int r = 0; r < ngpu - 1; r++) {
+      float ms;
+      CHECK(cudaEventElapsedTime(&ms, starts[r], stops[r]));
+      double us = (double)ms * 1000.0 / LATENCY_ITERS;
+      max_lat = std::max(max_lat, us);
+    }
+    sr_lat[reader] = max_lat;
+    printf("GPU %d: %.2f us (max across %d peers)\n", reader, max_lat, ngpu - 1);
+
+    for (int r = 0; r < ngpu - 1; r++) {
+      CHECK(cudaEventDestroy(starts[r]));
+      CHECK(cudaEventDestroy(stops[r]));
+      CHECK(cudaFree(peer_local[r]));
+      CHECK(cudaStreamDestroy(peer_streams[r]));
+    }
+  }
+
+  // ---- Test 3: All GPUs read all peers simultaneously ----
+  printf("\n=== All GPUs read all peers simultaneously (us) ===\n");
+  printf("Each GPU has %d streams, %d total concurrent kernels.\n\n",
+         ngpu - 1, ngpu * (ngpu - 1));
+
+  // Allocate per-GPU, per-peer streams and scratch.
+  std::vector<std::vector<cudaStream_t>> ac_streams(ngpu, std::vector<cudaStream_t>(ngpu - 1));
+  std::vector<std::vector<void*>> ac_local(ngpu, std::vector<void*>(ngpu - 1));
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    for (int r = 0; r < ngpu - 1; r++) {
+      CHECK(cudaStreamCreate(&ac_streams[i][r]));
+      CHECK(cudaMalloc(&ac_local[i][r], sizeof(int)));
+    }
+  }
+
+  // Warmup.
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    for (int r = 0; r < ngpu - 1; r++) {
+      int peer = (i + r + 1) % ngpu;
+      for (int w = 0; w < LATENCY_WARMUP; w++)
+        latency_read_kernel<<<1, 1, 0, ac_streams[i][r]>>>((const int*)bufs[peer], (int*)ac_local[i][r], LATENCY_WORDS);
+    }
+  }
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    for (int r = 0; r < ngpu - 1; r++)
+      CHECK(cudaStreamSynchronize(ac_streams[i][r]));
+  }
+
+  // Timed.
+  std::barrier ac_barrier(ngpu);
+  std::vector<double> ac_lat(ngpu);
+  std::vector<std::thread> ac_threads;
+
+  for (int i = 0; i < ngpu; i++) {
+    ac_threads.emplace_back([&, i]() {
+      CHECK(cudaSetDevice(i));
+
+      ac_barrier.arrive_and_wait();
+
+      // Launch all peer kernels, measure per-stream.
+      std::vector<cudaEvent_t> starts(ngpu - 1), stops(ngpu - 1);
+      for (int r = 0; r < ngpu - 1; r++) {
+        CHECK(cudaEventCreate(&starts[r]));
+        CHECK(cudaEventCreate(&stops[r]));
+      }
+      for (int r = 0; r < ngpu - 1; r++) {
+        int peer = (i + r + 1) % ngpu;
+        CHECK(cudaEventRecord(starts[r], ac_streams[i][r]));
+        for (int it = 0; it < LATENCY_ITERS; it++)
+          latency_read_kernel<<<1, 1, 0, ac_streams[i][r]>>>((const int*)bufs[peer], (int*)ac_local[i][r], LATENCY_WORDS);
+        CHECK(cudaEventRecord(stops[r], ac_streams[i][r]));
+      }
+      for (int r = 0; r < ngpu - 1; r++)
+        CHECK(cudaStreamSynchronize(ac_streams[i][r]));
+
+      double max_lat = 0;
+      for (int r = 0; r < ngpu - 1; r++) {
+        float ms;
+        CHECK(cudaEventElapsedTime(&ms, starts[r], stops[r]));
+        double us = (double)ms * 1000.0 / LATENCY_ITERS;
+        max_lat = std::max(max_lat, us);
+        CHECK(cudaEventDestroy(starts[r]));
+        CHECK(cudaEventDestroy(stops[r]));
+      }
+      ac_lat[i] = max_lat;
+    });
+  }
+  for (auto& t : ac_threads) t.join();
+
+  double ac_avg = 0;
+  for (int i = 0; i < ngpu; i++) {
+    printf("GPU %d: %.2f us (max across %d peers)\n", i, ac_lat[i], ngpu - 1);
+    ac_avg += ac_lat[i];
+  }
+  ac_avg /= ngpu;
+
+  // Score.
+  printf("\n");
+  printf("===========================================================\n");
+  printf("  LATENCY SCORE:         %.2f\n", seq_avg / ac_avg);
+  printf("  (%.2f us avg 1:1  /  %.2f us loaded)\n", seq_avg, ac_avg);
+  printf("  1.00 = no degradation under load\n");
+  printf("===========================================================\n");
+
+  // Cleanup.
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    for (int r = 0; r < ngpu - 1; r++) {
+      CHECK(cudaFree(ac_local[i][r]));
+      CHECK(cudaStreamDestroy(ac_streams[i][r]));
+    }
+  }
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaFree(bufs[i]));
+    CHECK(cudaFree(local[i]));
+    CHECK(cudaStreamDestroy(streams[i]));
+  }
 }
