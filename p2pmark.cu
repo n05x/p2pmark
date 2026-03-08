@@ -683,9 +683,10 @@ static void run_latency_tests(int ngpu) {
 
   printf("\n");
   printf("===========================================================\n");
-  printf("  P2P LATENCY:           %6.2f us  (best pair, isolated)\n", seq_min);
-  printf("  LOADED LATENCY (avg):  %6.2f us  (all GPUs concurrent)\n", ac_avg);
-  printf("  LOADED LATENCY (max):  %6.2f us  (worst GPU concurrent)\n", ac_max);
+  printf("  Min latency:           %6.2f us  (best pair, isolated)\n", seq_min);
+  printf("  Mean latency:          %6.2f us  (per GPU under full load)\n", ac_avg);
+  printf("\n");
+  printf("  EFFECTIVE LATENCY:     %6.2f us  (all GPUs done reading all peers)\n", ac_max);
   printf("===========================================================\n");
 
   // Cleanup.

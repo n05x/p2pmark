@@ -65,8 +65,9 @@ Requires CUDA toolkit and a C++20 compiler (`nvcc` with `-std=c++20`).
 
 ```
 ===========================================================
-  P2P LATENCY:             4.10 us  (best pair, isolated)
-  LOADED LATENCY (avg):    6.14 us  (all GPUs concurrent)
-  LOADED LATENCY (max):    6.14 us  (worst GPU concurrent)
+  Min latency:             4.10 us  (best pair, isolated)
+  Mean latency:            6.14 us  (per GPU under full load)
+
+  EFFECTIVE LATENCY:       6.14 us  (all GPUs done reading all peers)
 ===========================================================
 ```
