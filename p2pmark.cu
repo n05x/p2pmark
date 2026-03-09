@@ -1,10 +1,22 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <nccl.h>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include <thread>
 #include <barrier>
 #include <chrono>
+
+#define CHECK_NCCL(cmd) do {                                                \
+  ncclResult_t r = cmd;                                                     \
+  if (r != ncclSuccess) {                                                   \
+    fprintf(stderr, "NCCL error %s:%d: %s\n", __FILE__, __LINE__,          \
+            ncclGetErrorString(r));                                          \
+    exit(1);                                                                \
+  }                                                                         \
+} while (0)
 
 #define CHECK(cmd)                                                        \
   do {                                                                    \
@@ -25,6 +37,155 @@ static constexpr int ITERS = 20;
 static constexpr size_t LATENCY_SIZE = 128;  // one cacheline
 static constexpr int LATENCY_WORDS = LATENCY_SIZE / sizeof(int);
 static constexpr int LATENCY_ITERS = 10000;
+
+// ---- PCIe allreduce kernel (from pcie_allreduce.cu, torch deps stripped) ----
+
+namespace pcie_ar {
+
+constexpr int kMaxBlocks = 36;
+using FlagType = uint32_t;
+constexpr int kFlagStride = 32;
+
+struct Signal {
+  alignas(128) FlagType self_counter[kMaxBlocks][8];
+  alignas(128) FlagType peer_counter[2][kMaxBlocks][16 * kFlagStride];
+};
+
+struct __align__(16) RankData {
+  const void* __restrict__ ptrs[8];
+};
+
+struct __align__(16) RankSignals {
+  Signal* signals[8];
+};
+
+template <typename T, int sz>
+struct __align__(alignof(T) * sz) array_t {
+  T data[sz];
+  using type = T;
+  static constexpr int size = sz;
+};
+
+template <typename T>
+struct packed_t {
+  using P = array_t<T, 16 / sizeof(T)>;
+  using A = array_t<float, 16 / sizeof(T)>;
+};
+
+#define DINLINE __device__ __forceinline__
+
+DINLINE float upcast_s(half val) { return __half2float(val); }
+template <typename T> DINLINE T downcast_s(float val);
+template <> DINLINE half downcast_s(float val) { return __float2half(val); }
+DINLINE half& assign_add(half& a, half b) { a = __hadd(a, b); return a; }
+DINLINE float& assign_add(float& a, float b) { return a += b; }
+
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+DINLINE float upcast_s(nv_bfloat16 val) { return __bfloat162float(val); }
+template <> DINLINE nv_bfloat16 downcast_s(float val) { return __float2bfloat16(val); }
+DINLINE nv_bfloat16& assign_add(nv_bfloat16& a, nv_bfloat16 b) { a = __hadd(a, b); return a; }
+#endif
+
+template <typename T, int N>
+DINLINE array_t<T, N>& packed_assign_add(array_t<T, N>& a, array_t<T, N> b) {
+#pragma unroll
+  for (int i = 0; i < N; i++) assign_add(a.data[i], b.data[i]);
+  return a;
+}
+
+template <typename T, int N>
+DINLINE array_t<float, N> upcast(array_t<T, N> val) {
+  if constexpr (std::is_same<T, float>::value) {
+    return val;
+  } else {
+    array_t<float, N> out;
+#pragma unroll
+    for (int i = 0; i < N; i++) out.data[i] = upcast_s(val.data[i]);
+    return out;
+  }
+}
+
+template <typename O>
+DINLINE O downcast(array_t<float, O::size> val) {
+  if constexpr (std::is_same<typename O::type, float>::value) {
+    return val;
+  } else {
+    O out;
+#pragma unroll
+    for (int i = 0; i < O::size; i++) out.data[i] = downcast_s<typename O::type>(val.data[i]);
+    return out;
+  }
+}
+
+static DINLINE void st_flag_relaxed(FlagType* flag_addr, FlagType flag) {
+  asm volatile("st.relaxed.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+}
+
+static DINLINE FlagType ld_flag_relaxed(FlagType* flag_addr) {
+  FlagType flag;
+  asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
+  return flag;
+}
+
+template <int ngpus, bool is_start>
+DINLINE void multi_gpu_barrier(const RankSignals& sg, Signal* self_sg, int rank) {
+  if constexpr (!is_start) __syncthreads();
+  if (threadIdx.x < ngpus) {
+    __threadfence_system();
+    auto val = self_sg->self_counter[blockIdx.x][threadIdx.x] += 1;
+    auto peer_counter_ptr = &sg.signals[threadIdx.x]->peer_counter[val % 2][blockIdx.x][rank * kFlagStride];
+    auto self_counter_ptr = &self_sg->peer_counter[val % 2][blockIdx.x][threadIdx.x * kFlagStride];
+    st_flag_relaxed(peer_counter_ptr, val);
+    while (ld_flag_relaxed(self_counter_ptr) != val);
+  }
+  __syncthreads();
+}
+
+template <typename P, int ngpus, typename A>
+DINLINE P packed_reduce(const P* ptrs[], int idx) {
+  A tmp = upcast(ptrs[0][idx]);
+#pragma unroll
+  for (int i = 1; i < ngpus; i++) packed_assign_add(tmp, upcast(ptrs[i][idx]));
+  return downcast<P>(tmp);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
+  const P* rotated[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    rotated[i] = (const P*)dp.ptrs[(rank + i) % ngpus];
+  }
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
+    ((P*)result)[idx] = packed_reduce<P, ngpus, A>(rotated, idx);
+  }
+}
+
+template <typename T>
+static void launch_kernel(int ngpus, int blocks, int threads, cudaStream_t stream,
+                          RankData* rd, RankSignals rs, Signal* self_sg,
+                          T* output, int rank, int packed_size) {
+#define KL(ng) pcie_allreduce_kernel<T, ng><<<blocks, threads, 0, stream>>>(rd, rs, self_sg, output, rank, packed_size)
+  switch (ngpus) {
+    case 2: KL(2); break;
+    case 3: KL(3); break;
+    case 4: KL(4); break;
+    case 5: KL(5); break;
+    case 6: KL(6); break;
+    case 7: KL(7); break;
+    case 8: KL(8); break;
+  }
+#undef KL
+}
+
+#undef DINLINE
+
+}  // namespace pcie_ar
 
 // Cache-volatile load — bypasses L2 so every read goes over PCIe/NVLink.
 __device__ __forceinline__ int load_cv(const int* addr) {
@@ -87,11 +248,14 @@ double measure_bw(int src, int dst, size_t bytes, cudaStream_t stream) {
 }
 
 static void run_latency_tests(int ngpu);
+static void run_allreduce_tests(int ngpu);
 
 int main(int argc, char** argv) {
   bool latency_mode = false;
+  bool allreduce_mode = false;
   for (int i = 1; i < argc; i++) {
     if (std::string(argv[i]) == "--latency") latency_mode = true;
+    if (std::string(argv[i]) == "--allreduce") allreduce_mode = true;
   }
 
   int ngpu;
@@ -113,6 +277,10 @@ int main(int argc, char** argv) {
 
   if (latency_mode) {
     run_latency_tests(ngpu);
+    return 0;
+  }
+  if (allreduce_mode) {
+    run_allreduce_tests(ngpu);
     return 0;
   }
 
@@ -697,6 +865,233 @@ static void run_latency_tests(int ngpu) {
     CHECK(cudaFree(bufs[i]));
     CHECK(cudaFree(local[i]));
     CHECK(cudaFree(cycles_buf[i]));
+    CHECK(cudaStreamDestroy(streams[i]));
+  }
+}
+
+// ---- Allreduce mode ----
+
+// Benchmark custom allreduce via CUDA graph replay. Returns time in us.
+static double bench_custom_ar(int ngpu, size_t sz,
+                              std::vector<void*>& input, std::vector<void*>& output,
+                              std::vector<pcie_ar::Signal*>& sigs,
+                              std::vector<void*>& rd_dev, pcie_ar::RankSignals& rs,
+                              std::vector<cudaStream_t>& streams) {
+  using T = half;
+  constexpr int d = pcie_ar::packed_t<T>::P::size;
+  int num_elements = sz / sizeof(T);
+  int packed_size = num_elements / d;
+  int threads = 512;
+  int blocks = std::min(36, (packed_size + threads - 1) / threads);
+  blocks = std::max(blocks, 1);
+  int iters = (sz <= 1024 * 1024) ? 2000 : 200;
+
+  // Reset signals.
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaMemset(sigs[i], 0, sizeof(pcie_ar::Signal)));
+    CHECK(cudaDeviceSynchronize());
+  }
+
+  // Warmup (non-graph, establishes barrier state).
+  {
+    std::barrier bar(ngpu);
+    std::vector<std::thread> tv;
+    for (int i = 0; i < ngpu; i++) {
+      tv.emplace_back([&, i]() {
+        CHECK(cudaSetDevice(i));
+        bar.arrive_and_wait();
+        for (int w = 0; w < 20; w++)
+          pcie_ar::launch_kernel<T>(ngpu, blocks, threads, streams[i],
+              (pcie_ar::RankData*)rd_dev[i], rs, sigs[i], (T*)output[i], i, packed_size);
+        CHECK(cudaStreamSynchronize(streams[i]));
+      });
+    }
+    for (auto& t : tv) t.join();
+  }
+
+  // Capture one allreduce per GPU into a graph.
+  std::vector<cudaGraph_t> graphs(ngpu);
+  std::vector<cudaGraphExec_t> execs(ngpu);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaStreamBeginCapture(streams[i], cudaStreamCaptureModeThreadLocal));
+    pcie_ar::launch_kernel<T>(ngpu, blocks, threads, streams[i],
+        (pcie_ar::RankData*)rd_dev[i], rs, sigs[i], (T*)output[i], i, packed_size);
+    CHECK(cudaStreamEndCapture(streams[i], &graphs[i]));
+    CHECK(cudaGraphInstantiate(&execs[i], graphs[i], 0));
+  }
+
+  // Timed: replay graphs from concurrent threads.
+  std::barrier tbar(ngpu);
+  std::vector<double> per_gpu_us(ngpu);
+  std::vector<std::thread> tv;
+
+  for (int i = 0; i < ngpu; i++) {
+    tv.emplace_back([&, i]() {
+      CHECK(cudaSetDevice(i));
+      cudaEvent_t e0, e1;
+      CHECK(cudaEventCreate(&e0));
+      CHECK(cudaEventCreate(&e1));
+      tbar.arrive_and_wait();
+      CHECK(cudaEventRecord(e0, streams[i]));
+      for (int it = 0; it < iters; it++)
+        CHECK(cudaGraphLaunch(execs[i], streams[i]));
+      CHECK(cudaEventRecord(e1, streams[i]));
+      CHECK(cudaStreamSynchronize(streams[i]));
+      float ms;
+      CHECK(cudaEventElapsedTime(&ms, e0, e1));
+      per_gpu_us[i] = (double)ms * 1000.0 / iters;
+      CHECK(cudaEventDestroy(e0));
+      CHECK(cudaEventDestroy(e1));
+    });
+  }
+  for (auto& t : tv) t.join();
+
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaGraphExecDestroy(execs[i]));
+    CHECK(cudaGraphDestroy(graphs[i]));
+  }
+
+  double max_us = 0;
+  for (int i = 0; i < ngpu; i++) max_us = std::max(max_us, per_gpu_us[i]);
+  return max_us;
+}
+
+// Benchmark NCCL allreduce (no graph — NCCL group ops don't support
+// multi-stream capture in single-process mode). Returns time in us.
+static double bench_nccl_ar(int ngpu, size_t sz,
+                            std::vector<void*>& input, std::vector<void*>& output,
+                            std::vector<ncclComm_t>& comms,
+                            std::vector<cudaStream_t>& streams) {
+  int count = sz / sizeof(half);
+  int iters = (sz <= 1024 * 1024) ? 2000 : 200;
+
+  // Warmup.
+  for (int w = 0; w < 20; w++) {
+    CHECK_NCCL(ncclGroupStart());
+    for (int i = 0; i < ngpu; i++)
+      CHECK_NCCL(ncclAllReduce(input[i], output[i], count, ncclFloat16, ncclSum, comms[i], streams[i]));
+    CHECK_NCCL(ncclGroupEnd());
+  }
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaStreamSynchronize(streams[i]));
+  }
+
+  // Timed.
+  std::vector<cudaEvent_t> e0(ngpu), e1(ngpu);
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaEventCreate(&e0[i]));
+    CHECK(cudaEventCreate(&e1[i]));
+    CHECK(cudaEventRecord(e0[i], streams[i]));
+  }
+  for (int it = 0; it < iters; it++) {
+    CHECK_NCCL(ncclGroupStart());
+    for (int i = 0; i < ngpu; i++)
+      CHECK_NCCL(ncclAllReduce(input[i], output[i], count, ncclFloat16, ncclSum, comms[i], streams[i]));
+    CHECK_NCCL(ncclGroupEnd());
+  }
+  double max_us = 0;
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaEventRecord(e1[i], streams[i]));
+    CHECK(cudaStreamSynchronize(streams[i]));
+    float ms;
+    CHECK(cudaEventElapsedTime(&ms, e0[i], e1[i]));
+    double us = (double)ms * 1000.0 / iters;
+    max_us = std::max(max_us, us);
+    CHECK(cudaEventDestroy(e0[i]));
+    CHECK(cudaEventDestroy(e1[i]));
+  }
+  return max_us;
+}
+
+static void run_allreduce_tests(int ngpu) {
+  using T = half;
+  constexpr int d = pcie_ar::packed_t<T>::P::size;
+
+  if (ngpu < 2 || ngpu > 8) {
+    fprintf(stderr, "Allreduce mode requires 2-8 GPUs, got %d\n", ngpu);
+    return;
+  }
+
+  printf("=== ALLREDUCE MODE (%d GPUs, fp16) ===\n\n", ngpu);
+
+  std::vector<size_t> sizes;
+  for (size_t s = 256; s <= 64ULL * 1024 * 1024; s *= 2) {
+    sizes.push_back(s);
+    if (s >= 32 * 1024 && s < 64 * 1024) {
+      sizes.push_back(s + s / 4);   // +25%
+      sizes.push_back(s + s / 2);   // +50%
+      sizes.push_back(s + 3 * s / 4); // +75%
+    }
+  }
+
+  size_t max_sz = sizes.back();
+
+  // Per-GPU resources (shared between custom and NCCL benchmarks).
+  std::vector<void*> input(ngpu), output(ngpu);
+  std::vector<pcie_ar::Signal*> sigs(ngpu);
+  std::vector<void*> rd_dev(ngpu);
+  std::vector<cudaStream_t> streams(ngpu);
+
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaMalloc(&input[i], max_sz));
+    CHECK(cudaMalloc(&output[i], max_sz));
+    CHECK(cudaMemset(input[i], i + 1, max_sz));
+    CHECK(cudaMalloc((void**)&sigs[i], sizeof(pcie_ar::Signal)));
+    CHECK(cudaMemset(sigs[i], 0, sizeof(pcie_ar::Signal)));
+    CHECK(cudaStreamCreate(&streams[i]));
+  }
+
+  // Custom allreduce setup.
+  pcie_ar::RankData rd;
+  for (int i = 0; i < ngpu; i++) rd.ptrs[i] = input[i];
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaMalloc(&rd_dev[i], sizeof(pcie_ar::RankData)));
+    CHECK(cudaMemcpy(rd_dev[i], &rd, sizeof(pcie_ar::RankData), cudaMemcpyHostToDevice));
+  }
+  pcie_ar::RankSignals rs;
+  for (int i = 0; i < ngpu; i++) rs.signals[i] = sigs[i];
+
+  // NCCL setup.
+  std::vector<ncclComm_t> comms(ngpu);
+  std::vector<int> devs(ngpu);
+  for (int i = 0; i < ngpu; i++) devs[i] = i;
+  CHECK_NCCL(ncclCommInitAll(comms.data(), ngpu, devs.data()));
+
+  printf("%10s  %12s  %12s  %s\n", "Size", "Custom (us)", "NCCL (us)", "Winner");
+  printf("---------- ------------ ------------ --------\n");
+
+  for (size_t sz : sizes) {
+    int num_elements = sz / sizeof(T);
+    if (num_elements % d != 0) continue;
+
+    double custom_us = bench_custom_ar(ngpu, sz, input, output, sigs, rd_dev, rs, streams);
+    double nccl_us = bench_nccl_ar(ngpu, sz, input, output, comms, streams);
+
+    char sz_str[32];
+    if (sz >= 1024 * 1024) snprintf(sz_str, sizeof(sz_str), "%zu MB", sz / (1024 * 1024));
+    else if (sz >= 1024)   snprintf(sz_str, sizeof(sz_str), "%zu KB", sz / 1024);
+    else                   snprintf(sz_str, sizeof(sz_str), "%zu B", sz);
+
+    const char* winner = (custom_us < nccl_us) ? "custom" : "NCCL";
+    double ratio = (custom_us < nccl_us) ? nccl_us / custom_us : custom_us / nccl_us;
+    printf("%10s  %12.1f  %12.1f  %s (%.1fx)\n", sz_str, custom_us, nccl_us, winner, ratio);
+  }
+
+  // Cleanup.
+  for (int i = 0; i < ngpu; i++) CHECK_NCCL(ncclCommDestroy(comms[i]));
+  for (int i = 0; i < ngpu; i++) {
+    CHECK(cudaSetDevice(i));
+    CHECK(cudaFree(input[i]));
+    CHECK(cudaFree(output[i]));
+    CHECK(cudaFree(sigs[i]));
+    CHECK(cudaFree(rd_dev[i]));
     CHECK(cudaStreamDestroy(streams[i]));
   }
 }
